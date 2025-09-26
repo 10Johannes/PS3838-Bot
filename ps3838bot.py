@@ -50,8 +50,7 @@ async def log_message(msg: str):
     except Exception as e:
         print(f"⚠️ Failed to send log to Telegram: {e}")
 
-# --- PARSING FUNCTION ---
-def parse_message(message_text):
+async def parse_message(message_text):
     sport = "Other"
     if "Tennis" in message_text:
         sport = "Tennis"
@@ -70,19 +69,18 @@ def parse_message(message_text):
         return None
     home, away = match.groups()
 
-    # Extract the title line (the one immediately after the match)
+    # Extract the title line (league name)
     lines = message_text.splitlines()
     title = None
     for i, line in enumerate(lines):
         if re.search(r"(.+)\s+vs\s+(.+)", line):
             if i + 1 < len(lines):
                 title_candidate = lines[i + 1].strip()
-                # Make sure it looks like a title, not a date
                 if not re.search(r"\d{1,2}:\d{2}", title_candidate):
                     title = title_candidate
             break
 
-    # Extract bet info (supports ML and HDP with handicap)
+    # Extract bet info
     bet = re.search(
         r"(ML Match|HDP Match)\s*:\s*(.+?)(?:\s+([+-]?\d+(?:\.\d+)?))?\s*@\s*([0-9.,]+)\s*\(([0-9.]+)\s*U\)",
         message_text
@@ -99,19 +97,17 @@ def parse_message(message_text):
         print(f"Stake too small ({stake_eur} < {config['min_stake']}), ignored")
         return None
 
-    # Minimum odds condition
     cond = re.search(r"No bet under ([0-9.,]+)", message_text)
     min_odds = float(cond.group(1).replace(",", ".")) if cond else 0.0
     if odds + config["odds_tolerance"] < min_odds:
         print(f"Odds too low ({odds} < {min_odds}), ignored")
         return None
     
-    # Temporary skip HDP matches
-    if market_type == "HDP Match":
-        print("HDP Match is not yet available.")
-        return None
+    # if market_type == "HDP Match":
+    #     print("HDP Match is not yet available.")
+    #     return None
 
-    return {
+    bet_info = {
         "uuid": str(uuid.uuid4()),
         "sport": sport,
         "sportId": 33 if sport == "Tennis" else 29,
@@ -127,6 +123,120 @@ def parse_message(message_text):
         "min_odds": min_odds
     }
 
+    print(json.dumps(bet_info, indent=4))
+
+    # --- Step 1: Get fixtures to find eventId + leagueId ---
+    fixtures_resp = session.get(
+        f"{PS3838_API_URL}/v3/fixtures",
+        params={"sportId": bet_info["sportId"]},
+        timeout=120
+    )
+
+    if fixtures_resp.status_code != 200 or not fixtures_resp.text.strip():
+        print(f"⚠️ Fixtures API error: {fixtures_resp.status_code}, body={fixtures_resp.text[:200]}")
+        return None
+
+    fixtures_data = fixtures_resp.json()
+    event_id = None
+    league_id = None
+    parent_id = None
+
+
+    # Save odds response for debugging
+    f_timestamp = "test"
+    f_debug_file = f"debug_fixtures_{f_timestamp}.json"
+    with open(f_debug_file, "w", encoding="utf-8") as f:
+        json.dump(fixtures_data, f, indent=2, ensure_ascii=False)
+
+    print(f"📂 Fixtures response saved to {f_debug_file}")
+    # await log_message(f"📂 Fixtures response saved to {f_debug_file}")
+
+    for league in fixtures_data.get("league", []):
+        if league.get("name", "").strip().lower() != bet_info["title"].lower():
+            continue
+        for event in league.get("events", []):
+            if(bet_info["market_type"] == "HDP Match"):
+                if(event.get("status") == "O"):
+                    if (event.get("home", "").strip().lower() == bet_info["home"].lower() and
+                        event.get("away", "").strip().lower() == bet_info["away"].lower()):
+                        event_id = event.get("id")
+                        league_id = league.get("id")
+                        parent_id = event.get("parentId")
+                        break
+                else:
+                    continue
+            else:
+                if (event.get("home", "").strip().lower() == bet_info["home"].lower() and
+                    event.get("away", "").strip().lower() == bet_info["away"].lower()):
+                    event_id = event.get("id")
+                    league_id = league.get("id")
+                    parent_id = event.get("parentId")
+                    break
+
+        if event_id:
+            break
+
+    if not event_id or not league_id:
+        print("⚠️ No matching event/league found in fixtures")
+        return None
+
+    bet_info["eventId"] = event_id
+    bet_info["leagueId"] = league_id
+    bet_info["parentId"] = parent_id
+
+    print(json.dumps(bet_info, indent=4))
+
+    # --- Step 2: Call /v2/line to validate odds ---
+    line_resp = session.get(
+        f"{PS3838_API_URL}/v2/line",
+        params={
+            "oddsFormat": "Decimal",
+            "sportId": bet_info["sportId"],
+            "leagueId": league_id,  # ✅ FIXED
+            "eventId": parent_id if (parent_id and (bet_info['market_type'] == "ML Match")) else event_id,
+            "periodNumber": 0,
+            "betType": "MONEYLINE" if market_type == "ML Match" else "SPREAD",
+            "team": "TEAM1" if bet_info["selection_type"] == "home" else "TEAM2",
+            "handicap": handicap if handicap else 0,
+        },
+        timeout=120
+    )
+
+    if line_resp.status_code != 200 or not line_resp.text.strip():
+        print(f"⚠️ Line API error: {line_resp.status_code}, body={line_resp.text[:200]}")
+        return None
+
+    line_data = line_resp.json()
+        # Save odds response for debugging
+    f_timestamp = "test"
+    f_debug_file = f"debug_line_{f_timestamp}.json"
+    with open(f_debug_file, "w", encoding="utf-8") as f:
+        json.dump(line_data, f, indent=2, ensure_ascii=False)
+
+    print(f"📂 Line response saved to {f_debug_file}")
+    # await log_message(f"📂 Line response saved to {f_debug_file}")
+
+    api_odds = line_data.get("price", 0.0)
+    line_id = line_data.get("lineId")
+    altline_id = line_data.get("altLineId")
+
+    if not api_odds or not line_id:
+        print("⚠️ Line odds or lineId missing")
+        return None
+
+    if api_odds < bet_info["min_odds"]:
+        print(f"⚠️ Odds is too low")
+        return None
+
+    bet_info["lineId"] = line_id
+    bet_info["api_odds"] = api_odds
+    bet_info["altLineId"] = altline_id
+    print(f"✅ Odds validated for event {event_id}, League={league_id}, Line={line_id}, Odds={api_odds}")
+
+    return bet_info
+
+
+
 
 
 # --- CHECK LINE STATUS ---
@@ -140,18 +250,11 @@ async def check_line_and_validate(bet_info):
         )
 
         if fixtures_resp.status_code != 200 or not fixtures_resp.text.strip():
-            await log_message(f"⚠️ Fixtures API error: {fixtures_resp.status_code}, body={fixtures_resp.text[:200]}")
+            print(f"📂 Fixtures response saved to {f_debug_file}")
+            # await log_message(f"⚠️ Fixtures API error: {fixtures_resp.status_code}, body={fixtures_resp.text[:200]}")
             return False
 
         fixtures_data = fixtures_resp.json()
-
-                # Save odds response for debugging
-        f_timestamp = "test"
-        f_debug_file = f"debug_fixtures_{f_timestamp}.json"
-        with open(f_debug_file, "w", encoding="utf-8") as f:
-            json.dump(fixtures_data, f, indent=2, ensure_ascii=False)
-
-        await log_message(f"📂 Fixtures response saved to {f_debug_file}")
 
         event_id = None
         for league in fixtures_data.get("league", []):
@@ -183,7 +286,7 @@ async def check_line_and_validate(bet_info):
         odds_resp = session.get(
             f"{PS3838_API_URL}/v3/odds",
             params={"sportId": bet_info["sportId"]},
-            timeout=10
+            timeout=120
         )
 
         if odds_resp.status_code != 200 or not odds_resp.text.strip():
@@ -198,15 +301,16 @@ async def check_line_and_validate(bet_info):
         with open(debug_file, "w", encoding="utf-8") as f:
             json.dump(odds_data, f, indent=2, ensure_ascii=False)
 
-        await log_message(f"📂 Odds response saved to {debug_file}")
+        # await log_message(f"📂 Odds response saved to {debug_file}")
+        print(f"📂 Odds response saved to {debug_file}")
 
         # --- Step 3: Find the same eventId in odds ---
         for league in odds_data.get("leagues", []):
             for event in league.get("events", []):
-                if event.get("id") == event_id:
+                if event.get("id") == bet_info['eventId']:
                     periods = event.get("periods", [])
                     if not periods:
-                        await log_message(f"⚠️ No periods found for event {event_id}")
+                        await log_message(f"⚠️ No periods found for event {bet_info['eventId']}")
                         return False
 
                     p = periods[0]
@@ -215,10 +319,10 @@ async def check_line_and_validate(bet_info):
                     bet_info["spreads"] = p.get("spreads", [])
                     bet_info["moneyline"] = p.get("moneyline", {})
 
-                    print(f"✅ Found odds for event {event_id}: Line={bet_info['lineId']}")
+                    print(f"✅ Found odds for event {bet_info['eventId']}: Line={bet_info['lineId']}")
                     return True
 
-        await log_message(f"⚠️ Event {event_id} not found in odds response")
+        await log_message(f"⚠️ Event {bet_info['eventId']} not found in odds response")
         return False
 
     except Exception as e:
@@ -241,8 +345,7 @@ async def place_bet(bet_info):
         "stake": bet_info["stake"],
         "winRiskStake": "RISK",
         "lineId": bet_info["lineId"],
-        # "altLineId": ??? if bet_info["market_type"] == "ML Match" else ???,
-        "altLineId": None,
+        "altLineId": None if bet_info["market_type"] == "ML Match" else bet_info['altLineId'],
         "pitcher1MustStart": True,
         "pitcher2MustStart": True,
         "fillType": "NORMAL",
@@ -256,12 +359,26 @@ async def place_bet(bet_info):
     }
 
     try:
-        response = session.post(url, json=payload, timeout=10)
+        response = session.post(url, json=payload, timeout=120)
         result = response.json()
-        await log_message(
-            f"✅ Bet placed: {bet_info['selection']} ({bet_info['odds']}) "
-            f"stake €{bet_info['stake']} -> {result}"
+        straight = result.get("straightBet", {})
+
+        msg = (
+            f"✅ *Bet Placed Successfully!*\n\n"
+            f"🎾 *{straight.get('sportName')}* - {straight.get('leagueName')}\n"
+            f"🆚 {straight.get('team1')} vs {straight.get('team2')}\n\n"
+            f"💰 Stake: €{straight.get('risk')}\n"
+            f"📈 Odds: {straight.get('price')}\n"
+            f"📊 To Win: €{straight.get('win')}\n\n"
+            f"📌 Selection: *{straight.get('teamName')}*\n"
+            f"📝 Bet Type: {straight.get('betType')}\n"
+            f"🏷️ Bet ID: {straight.get('betId')}\n"
+            f"📅 Event Time: {straight.get('eventStartTime')}\n"
+            f"📌 Status: {straight.get('betStatus')}"
         )
+
+        await log_message(msg)
+
         return result
     except Exception as e:
         await log_message(f"Error placing bet {bet_info['selection']}: {e}")
@@ -336,9 +453,25 @@ async def handler(event):
         return  # don’t process commands as bets
 
     # --- Handle Bet Messages ---
-    bet_info = parse_message(message_text)
+    bet_info = await parse_message(message_text)
     if bet_info:
-        await log_message(f"✅ Bet detected: {bet_info}")
+        msg = (
+            f"✅ *Bet Detected!*\n\n"
+            f"🎾 *{bet_info['sport']}* - {bet_info['title']}\n"
+            f"🆚 {bet_info['home']} vs {bet_info['away']}\n\n"
+            f"📌 Market: {bet_info['market_type']}\n"
+            f"📌 Selection: *{bet_info['selection']}* ({bet_info['selection_type']})\n"
+            f"📈 Odds (Msg/API): {bet_info['odds']} / {bet_info.get('api_odds', 'N/A')}\n"
+            f"💰 Stake: €{bet_info['stake']}\n"
+            f"🔻 Min Odds: {bet_info['min_odds']}\n\n"
+            f"🏷️ Event ID: {bet_info.get('eventId')}\n"
+            f"🏟️ League ID: {bet_info.get('leagueId')}\n"
+            f"🆔 Line ID: {bet_info.get('lineId')}\n"
+            f"🔄 Alt Line ID: {bet_info.get('altLineId')}"
+        )
+
+        await log_message(msg)
+
         await place_bet(bet_info)
     else:
         await log_message("Message ignored (invalid, odds too low, stake too small, or sport not allowed)")
